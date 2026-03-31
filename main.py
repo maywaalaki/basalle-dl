@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram Media Downloader Bot - Somali Language (BULLETPROOF FIX V5)
+Telegram Media Downloader Bot - Somali Language
 Downloads media from YouTube, TikTok, Instagram, Facebook, X/Twitter
-Features: Dynamic Welcome, Interactive Menu, Broadcast System, Auto-restart
+Features: Dynamic Welcome, Interactive Menu, Broadcast System
 """
 
 import logging
@@ -13,31 +13,42 @@ import json
 import time
 import asyncio
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-from telegram.error import NetworkError, TimedOut, RetryAfter, Forbidden
+from telegram.error import Forbidden
+
 from downloader import download_media
 
 # ============================================================
 # CONFIGURATION & PERSISTENCE
 # ============================================================
-# IMPORTANT: Set these environment variables in your hosting provider
-TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0")) # Set your Telegram User ID here
+TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or "0")
+
 DOWNLOAD_DIR = "downloads"
 DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.txt")
-MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50MB Telegram limit
-KEEP_ALIVE_PORT = int(os.environ.get("PORT", 8080))
-ENABLE_KEEP_ALIVE = os.environ.get("ENABLE_KEEP_ALIVE", "true").lower() == "true"
+
+MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 MAX_RETRIES = 5
-RETRY_DELAY = 5  # seconds
+RETRY_DELAY = 5
+
+# Keep-alive is OPTIONAL.
+# IMPORTANT:
+# - If you are on Render and using polling, set ENABLE_KEEP_ALIVE=false
+# - If you really need it, use a separate port like 8081
+ENABLE_KEEP_ALIVE = os.environ.get("ENABLE_KEEP_ALIVE", "false").lower() == "true"
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8081"))
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Default configuration
+if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
+    raise RuntimeError("BOT_TOKEN is missing. Set BOT_TOKEN in environment variables.")
+
 DEFAULT_CONFIG = {
     "welcome_text": (
         "Hey {name} welcome to {botname} you can download social media videos from here 🚀\n\n"
@@ -49,17 +60,16 @@ DEFAULT_CONFIG = {
         "2️⃣ Dooro inaad ku soo dejiso fiidiyoow ama cod\n"
         "3️⃣ Waan kuu soo diri doonaa file-ka!"
     ),
-    "welcome_image": None, # File ID or local path
+    "welcome_image": None,
     "update_channel_url": "https://t.me/YourUpdateChannel",
-    "owner_contact_url": "https://t.me/YourUsername" # Replace with your Telegram link
+    "owner_contact_url": "https://t.me/YourUsername"
 }
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Ensure all default keys are present
                 for key, value in DEFAULT_CONFIG.items():
                     if key not in data:
                         data[key] = value
@@ -69,31 +79,30 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 def save_config(config_to_save):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config_to_save, f, indent=4)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_to_save, f, indent=4, ensure_ascii=False)
 
-# Load global config once
 config = load_config()
 
 def add_user(user_id):
     user_id = str(user_id)
     if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "w") as f:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
             f.write(user_id + "\n")
         return
-    
-    with open(USERS_FILE, "r") as f:
+
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
         users = f.read().splitlines()
-    
+
     if user_id not in users:
-        with open(USERS_FILE, "a") as f:
+        with open(USERS_FILE, "a", encoding="utf-8") as f:
             f.write(user_id + "\n")
 
 def get_users():
     if not os.path.exists(USERS_FILE):
         return []
-    with open(USERS_FILE, "r") as f:
-        return f.read().splitlines()
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        return [u.strip() for u in f.read().splitlines() if u.strip()]
 
 # ============================================================
 # LOGGING
@@ -119,10 +128,10 @@ MSG = {
     "success_video": "✅ Fiidiyowgaaga waa diyaar!",
     "success_audio": "✅ Codkaaga waa diyaar!",
     "failed": "❌ Waan ka xumahay, soo dejintu way guul darreysatay. Fadlan hubi link-ga oo isku day mar kale.",
-    "invalid_link": "⚠️ Link-ga aad soo dirtay ma ahan mid la aqoonsan yanay. Fadlan ii soo dir link ka YouTube, TikTok, Instagram, Facebook, ama X.",
+    "invalid_link": "⚠️ Link-ga aad soo dirtay ma ahan mid la aqoonsan yahay. Fadlan ii soo dir link ka YouTube, TikTok, Instagram, Facebook, ama X.",
     "error": "❌ Qalad ayaa dhacay. Fadlan isku day mar kale.",
     "too_large": "⚠️ File-ku aad buu u weyn yahay (>50MB). Telegram-gu ma oggolaanayo. Waxaan isku dayaa mid yar...",
-    "too_large_fail": "❌ File-ku aad buu u weyn yanay oo Telegram-gu ma diri karo. Fadlan isku day link kale.",
+    "too_large_fail": "❌ File-ku aad buu u weyn yahay oo Telegram-gu ma diri karo. Fadlan isku day link kale.",
     "processing": "🔄 Waan habeynayaa file-ka...",
     "help_text": (
         "📖 *Hagaha Isticmaalka:*\n\n"
@@ -133,7 +142,7 @@ MSG = {
         "✅ Waxaan taageernaa: YouTube, TikTok, Instagram, FB, iyo X."
     ),
     "broadcast_start": "📢 Baahinta fariinta waa la bilaabay...",
-    "broadcast_done": "✅ Baahinta waa la dhameeyay! Waxee loo diray {success} qof, {fail} qofna way ku guuldareysatay.",
+    "broadcast_done": "✅ Baahinta waa la dhameeyay! Waxay u dirtay {success} qof, {fail} qofna way ku guuldareysatay.",
     "not_owner": "❌ Qalad: Amarkan waxaa iska leh milkiilaha bot-ka oo kaliya.",
     "welcome_updated": "✅ Fariinta soo dhaweynta waa la cusbooneysiiyay!",
     "image_updated": "✅ Sawirka soo dhaweynta waa la cusbooneysiiyay!",
@@ -141,7 +150,6 @@ MSG = {
     "owner_url_updated": "✅ Link-ga milkiilaha waa la cusbooneysiiyay!",
 }
 
-# Supported URL patterns
 SUPPORTED_PATTERNS = [
     r"(https?://)?(www\.)?(youtube\.com|youtu\.be)",
     r"(https?://)?(www\.|vm\.)?tiktok\.com",
@@ -158,7 +166,6 @@ def is_supported_url(url: str) -> bool:
     return False
 
 def get_main_keyboard():
-    # Reload config to get latest URLs
     current_config = load_config()
     keyboard = [
         [InlineKeyboardButton(MSG["btn_help"], callback_data="help")],
@@ -171,47 +178,37 @@ def get_main_keyboard():
 # BOT HANDLERS
 # ============================================================
 async def start(update: Update, context) -> None:
+    if not update.message:
+        return
+
     user = update.effective_user
     add_user(user.id)
-    
-    # Reload fresh config
+
     current_config = load_config()
     welcome_template = current_config.get("welcome_text", DEFAULT_CONFIG["welcome_text"])
-    
-    # --- ROBUST BOT NAME FETCHING ---
-    # Way 1: Use your bot's known name as a fallback
-    bot_name = "hurdaay" 
-    
+
+    bot_name = "hurdaay"
     try:
-        # Way 2: Try to get it from the bot object
         bot_info = await context.bot.get_me()
         if bot_info and bot_info.first_name:
             bot_name = bot_info.first_name
     except Exception as e:
         logger.error(f"Could not fetch bot name: {e}")
-    
-    # Get User Name
+
     user_name = user.first_name or "Macaamiil"
-    
-    # --- BULLETPROOF REPLACEMENT ---
-    # We use a loop and multiple variations to ensure it never misses
+
     final_text = welcome_template
-    
-    # Replace {name}
     for tag in ["{name}", "{NAME}", "{Name}"]:
         final_text = final_text.replace(tag, user_name)
-        
-    # Replace {botname}
+
     for tag in ["{botname}", "{BOTNAME}", "{BotName}"]:
         final_text = final_text.replace(tag, bot_name)
-    
-    # Final regex pass just in case of weird spacing or formatting
+
     final_text = re.sub(r"\{name\}", user_name, final_text, flags=re.IGNORECASE)
     final_text = re.sub(r"\{botname\}", bot_name, final_text, flags=re.IGNORECASE)
-    
+
     reply_markup = get_main_keyboard()
-    
-    # Send Image if configured
+
     if current_config.get("welcome_image"):
         try:
             await update.message.reply_photo(
@@ -222,8 +219,7 @@ async def start(update: Update, context) -> None:
             return
         except Exception as e:
             logger.error(f"Error sending welcome photo: {e}")
-    
-    # Default to text message
+
     await update.message.reply_text(final_text, reply_markup=reply_markup)
 
 async def handle_message(update: Update, context) -> None:
@@ -241,16 +237,17 @@ async def handle_message(update: Update, context) -> None:
                 [InlineKeyboardButton(MSG["btn_video"], callback_data="video")],
                 [InlineKeyboardButton(MSG["btn_audio"], callback_data="audio")]
             ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(MSG["choose"], reply_markup=reply_markup)
+            await update.message.reply_text(MSG["choose"], reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             await update.message.reply_text(MSG["invalid_link"])
     else:
-        # If it's not a URL and not a command, just show welcome/help
         await start(update, context)
 
 async def button_callback(update: Update, context) -> None:
     query = update.callback_query
+    if not query:
+        return
+
     await query.answer()
 
     if query.data == "help":
@@ -281,22 +278,34 @@ async def button_callback(update: Update, context) -> None:
         if file_size > MAX_TELEGRAM_FILE_SIZE:
             await query.edit_message_text(text=MSG["too_large"])
             if download_type == "video":
-                os.remove(file_path)
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
                 file_path = await asyncio.to_thread(download_media, url, "video_small", DOWNLOAD_DIR)
+
                 if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) > MAX_TELEGRAM_FILE_SIZE:
                     await query.edit_message_text(text=MSG["too_large_fail"])
-                    if file_path and os.path.exists(file_path): os.remove(file_path)
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
                     return
             else:
                 await query.edit_message_text(text=MSG["too_large_fail"])
-                os.remove(file_path)
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
                 return
 
         await query.edit_message_text(text=MSG["processing"])
 
-        chat_id = query.message.chat_id
+        chat_id = query.message.chat.id
         with open(file_path, "rb") as f:
-            if "video" in download_type:
+            if download_type == "video":
                 await context.bot.send_video(chat_id=chat_id, video=f, caption=MSG["success_video"])
             else:
                 await context.bot.send_audio(chat_id=chat_id, audio=f, caption=MSG["success_audio"])
@@ -305,10 +314,16 @@ async def button_callback(update: Update, context) -> None:
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await query.edit_message_text(text=MSG["failed"])
+        try:
+            await query.edit_message_text(text=MSG["failed"])
+        except Exception:
+            pass
     finally:
         if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 # ============================================================
 # OWNER COMMANDS
@@ -317,13 +332,12 @@ async def set_welcome(update: Update, context) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(MSG["not_owner"])
         return
-    
+
     new_text = " ".join(context.args)
     if not new_text:
         await update.message.reply_text("📌 Isticmaalka: /setwelcome [fariinta cusub]\nPlaceholders: {name}, {botname}")
         return
-    
-    # Reload current config, update welcome_text, and save
+
     current_config = load_config()
     current_config["welcome_text"] = new_text
     save_config(current_config)
@@ -333,11 +347,11 @@ async def set_welcome_image(update: Update, context) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(MSG["not_owner"])
         return
-    
+
     if not update.message.reply_to_message or not update.message.reply_to_message.photo:
         await update.message.reply_text("📌 Fadlan u jawaab (reply) sawir adigoo isticmaalaya amarka /setimage")
         return
-    
+
     photo_id = update.message.reply_to_message.photo[-1].file_id
     current_config = load_config()
     current_config["welcome_image"] = photo_id
@@ -348,11 +362,11 @@ async def set_channel(update: Update, context) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(MSG["not_owner"])
         return
-    
+
     if not context.args:
         await update.message.reply_text("📌 Isticmaalka: /setchannel [URL]")
         return
-    
+
     current_config = load_config()
     current_config["update_channel_url"] = context.args[0]
     save_config(current_config)
@@ -362,11 +376,11 @@ async def set_owner_contact(update: Update, context) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(MSG["not_owner"])
         return
-    
+
     if not context.args:
         await update.message.reply_text("📌 Isticmaalka: /setownerlink [URL]")
         return
-    
+
     current_config = load_config()
     current_config["owner_contact_url"] = context.args[0]
     save_config(current_config)
@@ -376,78 +390,76 @@ async def broadcast(update: Update, context) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(MSG["not_owner"])
         return
-    
+
     msg_to_send = " ".join(context.args)
     if not msg_to_send:
         await update.message.reply_text("📌 Isticmaalka: /broadcast [fariinta]")
         return
-    
+
     users = get_users()
     await update.message.reply_text(MSG["broadcast_start"])
-    
+
     success, fail = 0, 0
     for user_id in users:
         try:
-            await context.bot.send_message(chat_id=user_id, text=msg_to_send)
+            await context.bot.send_message(chat_id=int(user_id), text=msg_to_send)
             success += 1
-            await asyncio.sleep(0.05) # Avoid flood limits
+            await asyncio.sleep(0.05)
         except Forbidden:
-            fail += 1 # User blocked bot
+            fail += 1
         except Exception as e:
             logger.error(f"Broadcast failed for {user_id}: {e}")
             fail += 1
-            
+
     await update.message.reply_text(MSG["broadcast_done"].format(success=success, fail=fail))
 
 async def error_handler(update, context) -> None:
-    logger.error(f"Update {update} caused error: {context.error}")
+    logger.error(f"Update {update} caused error: {context.error}", exc_info=True)
 
 # ============================================================
-# KEEP-ALIVE WEB SERVER
+# OPTIONAL KEEP-ALIVE SERVER
 # ============================================================
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass
+
 def start_keep_alive_server():
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    class KeepAliveHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, format, *args): pass
-    server = HTTPServer(("0.0.0.0", KEEP_ALIVE_PORT), KeepAliveHandler)
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", HEALTH_PORT), KeepAliveHandler)
+        logger.info(f"Keep-alive server started on port {HEALTH_PORT}")
+        server.serve_forever()
+    except OSError as e:
+        logger.error(f"Keep-alive server failed to start: {e}")
 
 # ============================================================
 # MAIN RUNNER
 # ============================================================
 def run_bot():
-    while True:
-        try:
-            if ENABLE_KEEP_ALIVE:
-                threading.Thread(target=start_keep_alive_server, daemon=True).start()
+    if ENABLE_KEEP_ALIVE:
+        threading.Thread(target=start_keep_alive_server, daemon=True).start()
 
-            application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
 
-            # User Handlers
-            application.add_handler(CommandHandler("start", start))
-            application.add_handler(CallbackQueryHandler(button_callback))
-            
-            # Owner Handlers
-            application.add_handler(CommandHandler("setwelcome", set_welcome))
-            application.add_handler(CommandHandler("setimage", set_welcome_image))
-            application.add_handler(CommandHandler("setchannel", set_channel))
-            application.add_handler(CommandHandler("setownerlink", set_owner_contact))
-            application.add_handler(CommandHandler("broadcast", broadcast))
-            
-            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            
-            application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
-            logger.info("Bot started...")
-            application.run_polling(drop_pending_updates=True)
-        except Exception as e:
-            logger.error(f"Bot crashed: {e}")
-            time.sleep(5)
+    application.add_handler(CommandHandler("setwelcome", set_welcome))
+    application.add_handler(CommandHandler("setimage", set_welcome_image))
+    application.add_handler(CommandHandler("setchannel", set_channel))
+    application.add_handler(CommandHandler("setownerlink", set_owner_contact))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot started...")
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     run_bot()
